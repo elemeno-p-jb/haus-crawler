@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -50,16 +49,23 @@ def save_seen(seen):
     )
 
 
-def send_ntfy(message):
+def send_ntfy(item):
     topic = os.environ["NTFY_TOPIC"]
+
+    message = (
+        f"Quelle: {item['source']}\n\n"
+        f"{item['title']}\n\n"
+        f"{item['url']}"
+    )
 
     response = requests.post(
         f"https://ntfy.sh/{topic}",
         data=message.encode("utf-8"),
         headers={
-            "Title": "Neues Immobilien-Inserat",
+            "Title": f"Neues Inserat – {item['source']}",
             "Priority": "high",
             "Tags": "house",
+            "Click": item["url"],
         },
         timeout=20,
     )
@@ -67,145 +73,148 @@ def send_ntfy(message):
     response.raise_for_status()
 
 
+def extract_links(html, base_url, source):
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+
+        if not href:
+            continue
+
+        text = " ".join(link.stripped_strings).strip()
+
+        if len(text) < 20:
+            continue
+
+        full_url = urljoin(base_url, href)
+
+        results.append(
+            {
+                "key": f"{source}:{full_url}",
+                "source": source,
+                "title": text[:300],
+                "url": full_url,
+            }
+        )
+
+    unique = {}
+
+    for item in results:
+        unique[item["key"]] = item
+
+    return list(unique.values())
+
+
 def get_sparkasse():
+    print("Prüfe Sparkasse ...")
+
     response = requests.get(
         SPARKASSE_URL,
         headers=HEADERS,
         timeout=30,
     )
+
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    results = extract_links(
+        response.text,
+        SPARKASSE_URL,
+        "Sparkasse",
+    )
 
-    results = []
+    print(f"Sparkasse: {len(results)} mögliche Einträge")
 
-    # Die Inserate sind auf der aktuellen Seite als Links vorhanden.
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-
-        if "/immobilien/" not in href:
-            continue
-
-        text = " ".join(link.stripped_strings)
-
-        if len(text) < 20:
-            continue
-
-        full_url = urljoin(SPARKASSE_URL, href)
-
-        # URL als stabile Kennung verwenden
-        key = f"sparkasse:{full_url}"
-
-        results.append({
-            "key": key,
-            "source": "Sparkasse",
-            "title": text,
-            "url": full_url,
-        })
-
-    # Duplikate entfernen
-    unique = {}
-    for item in results:
-        unique[item["key"]] = item
-
-    return list(unique.values())
+    return results
 
 
 def get_vr():
-    """
-    Die VR-Seite lädt die eigentliche Immobiliensuche dynamisch.
-    Dieser erste Test versucht, mögliche Immobilienlinks aus
-    dem ausgelieferten HTML zu erkennen.
+    print("Prüfe VR ...")
 
-    Falls die VR-Seite die Ergebnisse erst per JavaScript/API lädt,
-    erweitern wir diesen Teil nach dem ersten Test mit Playwright.
-    """
     response = requests.get(
         VR_URL,
         headers=HEADERS,
         timeout=30,
     )
+
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    results = extract_links(
+        response.text,
+        VR_URL,
+        "VR",
+    )
 
-    results = []
+    print(f"VR: {len(results)} mögliche Einträge")
 
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-
-        if "immobilien" not in href.lower():
-            continue
-
-        text = " ".join(link.stripped_strings)
-
-        if len(text) < 20:
-            continue
-
-        full_url = urljoin(VR_URL, href)
-
-        results.append({
-            "key": f"vr:{full_url}",
-            "source": "VR",
-            "title": text,
-            "url": full_url,
-        })
-
-    unique = {}
-    for item in results:
-        unique[item["key"]] = item
-
-    return list(unique.values())
+    return results
 
 
 def main():
     seen = load_seen()
 
-    all_results = []
+    sparkasse = []
+    vr = []
 
     try:
-        all_results.extend(get_sparkasse())
+        sparkasse = get_sparkasse()
     except Exception as e:
-        print(f"Sparkasse Fehler: {e}")
+        print(f"Sparkasse FEHLER: {e}")
 
     try:
-        all_results.extend(get_vr())
+        vr = get_vr()
     except Exception as e:
-        print(f"VR Fehler: {e}")
+        print(f"VR FEHLER: {e}")
 
-    print(f"Gefundene Einträge: {len(all_results)}")
+    all_results = sparkasse + vr
 
-    new_items = [
-        item for item in all_results
-        if item["key"] not in seen
-    ]
+    print()
+    print("================================")
+    print(f"Sparkasse: {len(sparkasse)}")
+    print(f"VR:        {len(vr)}")
+    print(f"Gesamt:    {len(all_results)}")
+    print("================================")
+    print()
 
-    # Beim ersten Lauf nur Bestand speichern.
-    # Dadurch bekommst du nicht sofort 6 alte Sparkassen-Inserate als Alarm.
+    # Erster Lauf:
+    # vorhandenen Bestand nur speichern.
     if not seen:
-        print("Erster Lauf – vorhandene Inserate werden als Bestand gespeichert.")
+        print("Erster Lauf – Bestand wird gespeichert.")
 
         for item in all_results:
             seen.add(item["key"])
 
         save_seen(seen)
+
+        print(f"{len(all_results)} Einträge gespeichert.")
         return
 
-    for item in new_items:
-        message = (
-            f"Quelle: {item['source']}\n\n"
-            f"{item['title']}\n\n"
-            f"{item['url']}"
-        )
+    new_items = [
+        item
+        for item in all_results
+        if item["key"] not in seen
+    ]
 
-        print(f"NEU: {item['source']} – {item['title']}")
-        send_ntfy(message)
+    print(f"Neue Inserate: {len(new_items)}")
+
+    for item in new_items:
+        print()
+        print("NEUES INSERAT")
+        print(f"Quelle: {item['source']}")
+        print(f"Titel:  {item['title']}")
+        print(f"URL:    {item['url']}")
+
+        try:
+            send_ntfy(item)
+            print("Push: OK")
+        except Exception as e:
+            print(f"Push FEHLER: {e}")
+            continue
 
         seen.add(item["key"])
 
     save_seen(seen)
-
-    print(f"Neue Inserate: {len(new_items)}")
 
 
 if __name__ == "__main__":
