@@ -1,10 +1,9 @@
 import json
 import os
-from pathlib import Path
-from urllib.parse import urljoin
-
+import re
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 
 SPARKASSE_URL = (
@@ -19,202 +18,284 @@ SPARKASSE_URL = (
 
 VR_URL = (
     "https://www.vr.de/privatkunden/immobilien/immobiliensuche.html"
-    "?l=48691%2C+Vreden&d=10&lat=52.060807&lng=6.796994"
+    "?l=48691%2C+Vreden"
+    "&d=10"
+    "&lat=52.060807"
+    "&lng=6.796994"
 )
 
-STATE_FILE = Path("seen.json")
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0 Safari/537.36"
-    )
-}
+# Eigene Datei, damit die alten, zu breit erkannten Einträge
+# nicht mit dem neuen System vermischt werden.
+SEEN_FILE = "seen_v2.json"
 
 
 def load_seen():
-    if not STATE_FILE.exists():
+    if not os.path.exists(SEEN_FILE):
         return set()
 
     try:
-        return set(json.loads(STATE_FILE.read_text()))
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
     except Exception:
         return set()
 
 
 def save_seen(seen):
-    STATE_FILE.write_text(
-        json.dumps(sorted(seen), ensure_ascii=False, indent=2)
-    )
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
-def send_ntfy(item):
-    topic = os.environ["NTFY_TOPIC"]
-
-    message = (
-        f"Quelle: {item['source']}\n\n"
-        f"{item['title']}\n\n"
-        f"{item['url']}"
-    )
-
-    response = requests.post(
-        f"https://ntfy.sh/{topic}",
-        data=message.encode("utf-8"),
-        headers={
-            "Title": f"Neues Inserat – {item['source']}",
-            "Priority": "high",
-            "Tags": "house",
-            "Click": item["url"],
-        },
-        timeout=20,
-    )
-
-    response.raise_for_status()
-
-
-def extract_links(html, base_url, source):
-    soup = BeautifulSoup(html, "html.parser")
-    results = []
-
-    for link in soup.find_all("a", href=True):
-        href = link["href"].strip()
-
-        if not href:
-            continue
-
-        text = " ".join(link.stripped_strings).strip()
-
-        if len(text) < 20:
-            continue
-
-        full_url = urljoin(base_url, href)
-
-        results.append(
-            {
-                "key": f"{source}:{full_url}",
-                "source": source,
-                "title": text[:300],
-                "url": full_url,
-            }
+def send_ntfy(title, message, url):
+    try:
+        response = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            headers={
+                # Nur ASCII im Header verwenden!
+                "Title": title,
+                "Priority": "high",
+                "Tags": "house",
+                "Click": url,
+            },
+            data=message.encode("utf-8"),
+            timeout=20,
         )
 
-    unique = {}
+        response.raise_for_status()
+        print(f"Push OK: {title}")
 
-    for item in results:
-        unique[item["key"]] = item
+        return True
 
-    return list(unique.values())
+    except Exception as e:
+        print(f"Push FEHLER: {e}")
+        return False
 
 
 def get_sparkasse():
     print("Prüfe Sparkasse ...")
 
-    response = requests.get(
-        SPARKASSE_URL,
-        headers=HEADERS,
-        timeout=30,
-    )
+    try:
+        response = requests.get(
+            SPARKASSE_URL,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                )
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
 
-    response.raise_for_status()
+    except Exception as e:
+        print(f"Sparkasse FEHLER: {e}")
+        return []
 
-    results = extract_links(
-        response.text,
-        SPARKASSE_URL,
-        "Sparkasse",
-    )
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    print(f"Sparkasse: {len(results)} mögliche Einträge")
+    listings = {}
 
-    return results
+    # Bei Sparkasse sind die echten Exposés an /expose/ erkennbar.
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+
+        if "/expose/" not in href:
+            continue
+
+        if href.startswith("/"):
+            href = "https://immobilien.sparkasse.de" + href
+
+        title = link.get_text(" ", strip=True)
+
+        # Falls der Link selbst keinen brauchbaren Text enthält,
+        # versuchen wir den umgebenden Container.
+        if len(title) < 20:
+            parent = link.find_parent()
+            if parent:
+                title = parent.get_text(" ", strip=True)
+
+        if not title:
+            title = "Neues Sparkassen-Inserat"
+
+        listings[href] = {
+            "source": "Sparkasse",
+            "url": href,
+            "title": title,
+        }
+
+    print(f"Sparkasse: {len(listings)} echte Inserate")
+    return list(listings.values())
 
 
 def get_vr():
-    print("Prüfe VR ...")
+    print("\nPrüfe VR ...")
 
-    response = requests.get(
-        VR_URL,
-        headers=HEADERS,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    results = extract_links(
-        response.text,
-        VR_URL,
-        "VR",
-    )
-
-    print(f"VR: {len(results)} mögliche Einträge")
-
-    return results
-
-
-def main():
-    seen = load_seen()
-
-    sparkasse = []
-    vr = []
+    listings = {}
 
     try:
-        sparkasse = get_sparkasse()
-    except Exception as e:
-        print(f"Sparkasse FEHLER: {e}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox"],
+            )
 
-    try:
-        vr = get_vr()
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 1000},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                ),
+            )
+
+            page.goto(
+                VR_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+
+            # Die VR-Suche wird dynamisch geladen.
+            page.wait_for_timeout(8000)
+
+            # Alle Frames untersuchen, da die Immobiliensuche
+            # gegebenenfalls in einem eingebetteten Bereich läuft.
+            for frame in page.frames:
+                try:
+                    links = frame.locator("a[href]").all()
+
+                    for link in links:
+                        try:
+                            href = link.get_attribute("href")
+                            text = link.inner_text().strip()
+                        except Exception:
+                            continue
+
+                        if not href:
+                            continue
+
+                        href_lower = href.lower()
+
+                        # Offensichtliche Navigationslinks ignorieren.
+                        if any(
+                            x in href_lower
+                            for x in [
+                                "youtube.com",
+                                "linkedin.com",
+                                "werte-mitgliedschaft",
+                                "karte-sperren",
+                                "baufinanzierungsrechner",
+                                "grundstuecke.html",
+                            ]
+                        ):
+                            continue
+
+                        # Kandidaten für Immobilien-Inserate.
+                        candidate = (
+                            "/expose" in href_lower
+                            or "/immobilien/" in href_lower
+                            or "immobilie" in href_lower
+                            or "estate" in href_lower
+                            or "property" in href_lower
+                        )
+
+                        if not candidate:
+                            continue
+
+                        if href.startswith("/"):
+                            href = "https://www.vr.de" + href
+
+                        if not href.startswith("http"):
+                            continue
+
+                        # Sehr kurze/technische Links aussortieren.
+                        if len(text) < 10:
+                            continue
+
+                        listings[href] = {
+                            "source": "VR",
+                            "url": href,
+                            "title": text,
+                        }
+
+                except Exception:
+                    continue
+
+            browser.close()
+
     except Exception as e:
         print(f"VR FEHLER: {e}")
 
-    all_results = sparkasse + vr
+    print(f"VR: {len(listings)} mögliche echte Inserate")
+    return list(listings.values())
 
-    print()
+
+def main():
     print("================================")
+    print("Immobilien-Monitor")
+    print("================================\n")
+
+    seen = load_seen()
+
+    sparkasse = get_sparkasse()
+    vr = get_vr()
+
+    all_listings = sparkasse + vr
+
+    print("\n================================")
     print(f"Sparkasse: {len(sparkasse)}")
     print(f"VR:        {len(vr)}")
-    print(f"Gesamt:    {len(all_results)}")
+    print(f"Gesamt:    {len(all_listings)}")
     print("================================")
-    print()
 
-    # Erster Lauf:
-    # vorhandenen Bestand nur speichern.
+    # Beim allerersten Lauf werden die aktuell vorhandenen
+    # Inserate nur gespeichert, nicht als "neu" gemeldet.
     if not seen:
-        print("Erster Lauf – Bestand wird gespeichert.")
-
-        for item in all_results:
-            seen.add(item["key"])
-
-        save_seen(seen)
-
-        print(f"{len(all_results)} Einträge gespeichert.")
+        print("\nErster Lauf: aktuelle Inserate werden gespeichert.")
+        print("Noch keine Push-Nachrichten.")
+        save_seen({item["url"] for item in all_listings})
         return
 
     new_items = [
         item
-        for item in all_results
-        if item["key"] not in seen
+        for item in all_listings
+        if item["url"] not in seen
     ]
 
-    print(f"Neue Inserate: {len(new_items)}")
+    print(f"\nNeue Inserate: {len(new_items)}")
+
+    successfully_processed = []
 
     for item in new_items:
-        print()
-        print("NEUES INSERAT")
-        print(f"Quelle: {item['source']}")
-        print(f"Titel:  {item['title']}")
-        print(f"URL:    {item['url']}")
+        title = re.sub(r"\s+", " ", item["title"]).strip()
 
-        try:
-            send_ntfy(item)
-            print("Push: OK")
-        except Exception as e:
-            print(f"Push FEHLER: {e}")
-            continue
+        print(f"\nNEU: {item['source']}")
+        print(title)
+        print(item["url"])
 
-        seen.add(item["key"])
+        # ASCII-only title für den HTTP-Header.
+        ntfy_title = f"Neues Inserat - {item['source']}"
 
+        message = (
+            f"{title}\n\n"
+            f"Quelle: {item['source']}\n"
+            f"{item['url']}"
+        )
+
+        if send_ntfy(
+            ntfy_title,
+            message,
+            item["url"],
+        ):
+            successfully_processed.append(item["url"])
+
+    # Nur erfolgreich verarbeitete neue Inserate als bekannt speichern.
+    seen.update(successfully_processed)
     save_seen(seen)
+
+    print("\n================================")
+    print("Fertig.")
+    print(f"Neu verarbeitet: {len(successfully_processed)}")
+    print("================================")
 
 
 if __name__ == "__main__":
