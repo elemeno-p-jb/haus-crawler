@@ -24,6 +24,9 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pip install -r requirements.txt
 
+      - name: Chromium installieren
+        run: playwright install --with-deps chromium
+
       - name: Monitor ausführen
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
